@@ -40,13 +40,8 @@ include_directories(${TBB_INCLUDE_DIRS})
 include_directories(${PROJECT_SOURCE_DIR}/thirdparty/sophus)
 
 # glog (使用现代CMake CONFIG模式，适配glog 0.6.0+)
-find_package(glog CONFIG REQUIRED)
-# 如果CONFIG模式失败，回退到旧的查找方式并添加必要的编译定义
-if(NOT TARGET glog::glog)
-    find_package(Glog REQUIRED)
-    include_directories(${Glog_INCLUDE_DIRS})
-    add_definitions(-DGLOG_USE_GLOG_EXPORT)
-endif()
+# find_package(glog REQUIRED)
+# include_directories(${Glog_INCLUDE_DIRS})
 
 # csparse
 find_package(CSparse REQUIRED)
@@ -115,19 +110,14 @@ endif ()
 
 
 
-# 根据glog的查找方式设置链接库
-if(TARGET glog::glog)
-    set(GLOG_LINK_LIBS glog::glog)
-else()
-    set(GLOG_LINK_LIBS glog gflags)
-endif()
 
     set(third_party_libs
             ${catkin_LIBRARIES}
             ${PCL_LIBRARIES}
             ${CERES_LIBRARIES}
             libtbb.so
-            ${GLOG_LINK_LIBS}
+            glog
+            gflags
             ${yaml-cpp_LIBRARIES}
             yaml-cpp
             TBB::tbb
