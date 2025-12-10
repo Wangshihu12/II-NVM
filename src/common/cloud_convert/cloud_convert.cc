@@ -13,7 +13,7 @@
 namespace zjloc
 {
 
-    void CloudConvert::Process(const livox_ros_driver::CustomMsg::ConstPtr &msg, std::vector<point3D> &pcl_out)
+    void CloudConvert::Process(const livox_ros_driver2::CustomMsg::ConstPtr &msg, std::vector<point3D> &pcl_out)
     {
         AviaHandler(msg);
         pcl_out = cloud_out_;
@@ -47,7 +47,7 @@ namespace zjloc
         pcl_out = cloud_out_;
     }
 
-    void CloudConvert::AviaHandler(const livox_ros_driver::CustomMsg::ConstPtr &msg)
+    void CloudConvert::AviaHandler(const livox_ros_driver2::CustomMsg::ConstPtr &msg)
     {
         cloud_out_.clear();
         cloud_full_.clear();

@@ -21,7 +21,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions")
 
 add_definitions(-DROOT_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/\")
-add_subdirectory(thirdparty/livox_ros_driver)
+# add_subdirectory(thirdparty/livox_ros_driver)
 
 find_package(catkin REQUIRED COMPONENTS
   geometry_msgs

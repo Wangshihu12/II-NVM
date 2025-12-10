@@ -2,7 +2,7 @@
 cmake_minimum_required(VERSION 3.0)
 
 # we only need livox message definition here
-project(livox_ros_driver)
+project(livox_ros_driver2)
 find_package(catkin REQUIRED COMPONENTS
         roscpp
         rospy

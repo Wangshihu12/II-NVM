@@ -41,7 +41,7 @@ nav_msgs::Path laserOdoPath;
 
 DEFINE_string(config_directory, "/home/cc/catkin_context/src/lio_nvm/config", "配置文件目录");
 
-void livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg)
+void livox_pcl_cbk(const livox_ros_driver2::CustomMsg::ConstPtr &msg)
 {
 
     std::vector<point3D> cloud_out;
