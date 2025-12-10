@@ -83,11 +83,11 @@ void standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg)
 
 void imuHandler(const sensor_msgs::Imu::ConstPtr &msg)
 {
-    Vec3d acc = Vec3d(msg->linear_acceleration.x, msg->linear_acceleration.y, msg->linear_acceleration.z);
+    Vec3d acc = Vec3d(msg->linear_acceleration.y, msg->linear_acceleration.x, msg->linear_acceleration.z);
     acc = acc * g_gravity / acc.norm();
     IMUPtr imu = std::make_shared<zjloc::IMU>(
         msg->header.stamp.toSec(),
-        Vec3d(msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z), acc);
+        Vec3d(msg->angular_velocity.y, msg->angular_velocity.x, msg->angular_velocity.z), acc);
     lio->pushData(imu);
 }
 
