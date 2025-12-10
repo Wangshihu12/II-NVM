@@ -10,39 +10,73 @@ double AngularDistance(const Eigen::Quaterniond &q_a, const Eigen::Quaterniond &
      return norm;
 }
 
+/**
+ * [功能描述]: 体素降采样函数，将点云按体素网格划分，每个体素只保留一个点
+ *            用于减少点云数量，同时保持空间分布均匀
+ * @param frame: 输入/输出点云，函数执行后会被降采样结果覆盖
+ * @param size_voxel: 体素边长大小，单位与点云坐标一致（通常为米）
+ */
 void subSampleFrame(std::vector<point3D> &frame, double size_voxel)
 {
+     // 创建体素网格哈希表：key为体素索引，value为该体素内的所有点
      std::tr1::unordered_map<voxel, std::vector<point3D>, std::hash<voxel>> grid;
+     
+     // 遍历所有点，将每个点分配到对应的体素中
      for (int i = 0; i < (int)frame.size(); i++)
      {
-          auto kx = static_cast<short>(frame[i].point[0] / size_voxel);
-          auto ky = static_cast<short>(frame[i].point[1] / size_voxel);
-          auto kz = static_cast<short>(frame[i].point[2] / size_voxel);
+          // 计算点所属体素的三维索引 (kx, ky, kz)
+          // 通过坐标除以体素大小并取整得到体素索引
+          auto kx = static_cast<short>(frame[i].point[0] / size_voxel);  // x方向体素索引
+          auto ky = static_cast<short>(frame[i].point[1] / size_voxel);  // y方向体素索引
+          auto kz = static_cast<short>(frame[i].point[2] / size_voxel);  // z方向体素索引
+          // 将点添加到对应体素的点集合中
           grid[voxel(kx, ky, kz)].push_back(frame[i]);
      }
+     
+     // 清空原始点云，准备存储降采样结果
      frame.resize(0);
      int step = 0;
+     
+     // 遍历所有非空体素，每个体素只取第一个点作为代表点
      for (const auto &n : grid)
      {
           if (n.second.size() > 0)
           {
+               // 取该体素内的第一个点作为代表点
                frame.push_back(n.second[0]);
                step++;
           }
      }
 }
 
+/**
+ * [功能描述]: 网格降采样函数，对输入点云进行体素化降采样，提取关键点
+ * @param frame: 输入点云，原始的3D点集合（只读）
+ * @param keypoints: 输出关键点，降采样后的点集合（输出参数）
+ * @param size_voxel_subsampling: 体素大小，控制降采样的分辨率，值越大点越稀疏
+ */
 void gridSampling(const std::vector<point3D> &frame, std::vector<point3D> &keypoints, double size_voxel_subsampling)
 {
+     // 清空输出关键点容器
      keypoints.resize(0);
+     
+     // 创建临时副本，因为subSampleFrame会修改输入数据
      std::vector<point3D> frame_sub;
      frame_sub.resize(frame.size());
+     
+     // 将原始点云复制到临时副本中
      for (int i = 0; i < (int)frame_sub.size(); i++)
      {
           frame_sub[i] = frame[i];
      }
+     
+     // 执行体素降采样，frame_sub中会保留降采样后的点
      subSampleFrame(frame_sub, size_voxel_subsampling);
+     
+     // 预分配内存，提高push_back效率
      keypoints.reserve(frame_sub.size());
+     
+     // 将降采样后的点复制到输出关键点容器中
      for (int i = 0; i < (int)frame_sub.size(); i++)
      {
           keypoints.push_back(frame_sub[i]);

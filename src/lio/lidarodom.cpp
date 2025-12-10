@@ -150,32 +150,46 @@ namespace zjloc
           }
      }
 
+     /**
+      * [功能描述]: 处理一组传感器测量数据（IMU + LiDAR），执行完整的激光里程计流程
+      *            包括：IMU预测、状态初始化、点云帧构建、位姿估计、ESKF观测更新、位姿发布
+      * @param meas: 测量数据组，包含同步后的IMU数据和LiDAR点云数据
+      */
      void lidarodom::ProcessMeasurements(MeasureGroup &meas)
      {
+          // 保存当前测量数据到成员变量
           measures_ = meas;
 
+          // 如果IMU尚未初始化，则尝试初始化IMU并返回
           if (imu_need_init_)
           {
                TryInitIMU();
                return;
           }
 
+          // 打印当前处理的帧序号
           std::cout << ANSI_COLOR_GREEN << "============== process frame: "
                     << index_frame << ANSI_COLOR_RESET << std::endl;
 
+          // 清空IMU状态缓存，为新一帧的IMU积分做准备
           imu_states_.clear(); //   need clear here
 
+          // 步骤1: IMU预测 - 利用IMU数据进行状态预测（位置、速度、姿态）
           zjloc::common::Timer::Evaluate([&]()
                                          { Predict(); },
                                          "predict");
 
+          // 步骤2: 状态初始化 - 初始化当前帧的优化状态
           zjloc::common::Timer::Evaluate([&]()
                                          { stateInitialization(); },
                                          "state init");
 
+          // 步骤3: 构建点云帧
+          // 将测量数据中的LiDAR点云复制到const_surf中
           std::vector<point3D> const_surf;
           const_surf.insert(const_surf.end(), meas.lidar_.begin(), meas.lidar_.end());
 
+          // 构建点云帧对象，包含点云数据、当前状态、起止时间戳
           cloudFrame *p_frame;
           zjloc::common::Timer::Evaluate([&]()
                                          { p_frame = buildFrame(const_surf, current_state,
@@ -183,120 +197,175 @@ namespace zjloc
                                                                 meas.lidar_end_time_); },
                                          "build frame");
 
+          // 步骤4: 位姿估计 - 通过点云配准优化当前帧位姿
           zjloc::common::Timer::Evaluate([&]()
                                          { poseEstimation(p_frame); },
                                          "poseEstimate");
 
+          // 从优化后的状态中提取位姿（旋转 + 平移），构建SE3李群表示
           SE3 pose_of_lo_ = SE3(current_state->rotation, current_state->translation);
 
+          // 步骤5: ESKF观测更新 - 将激光里程计位姿作为观测量更新误差状态卡尔曼滤波器
+          // 参数：位姿观测、位置噪声协方差(1e-2)、姿态噪声协方差(1e-2)
           zjloc::common::Timer::Evaluate([&]()
                                          { eskf_.ObserveSE3(pose_of_lo_, 1e-2, 1e-2); },
                                          "eskf_obs");
 
+          // 步骤6: 发布位姿到ROS
           zjloc::common::Timer::Evaluate([&]()
                                          {
+               // 发布激光里程计位姿（base_link相对于map的位姿）
                std::string laser_topic = "laser";
                pub_pose_to_ros(laser_topic, pose_of_lo_, meas.lidar_end_time_);
 
+               // 发布世界坐标系位姿（用于TF变换：world -> map）
                laser_topic = "world";
                SE3 pose_of_world = SE3(RIG_,Eigen::Vector3d(0,0,0));
                pub_pose_to_ros(laser_topic, pose_of_world, meas.lidar_end_time_); },
                                          "pub cloud");
 
+          // 步骤7: 状态管理与内存清理
+          // 将当前状态深拷贝保存到点云帧中
           p_frame->p_state = new state(current_state, true);
+          // 将当前状态深拷贝保存到全局状态历史列表中
           state *tmp_state = new state(current_state, true);
           all_state_frame.push_back(tmp_state);
+          // 创建新的状态对象用于下一帧（浅拷贝，共享部分数据）
           current_state = new state(current_state, false);
 
+          // 帧计数器递增
           index_frame++;
+          // 释放点云帧资源
           p_frame->release();
+          // 使用swap技巧释放vector内存，避免内存泄漏
           std::vector<point3D>().swap(meas.lidar_);
           std::vector<point3D>().swap(const_surf);
      }
 
+     /**
+      * [功能描述]: 位姿估计函数，执行点云配准优化和地图更新
+      *            包括：迭代优化位姿、增量式地图更新、视场角分割
+      * @param p_frame: 当前点云帧指针，包含点云数据和状态信息
+      */
      void lidarodom::poseEstimation(cloudFrame *p_frame)
      {
+          // 从第2帧开始才进行优化（第1帧用于初始化地图，无需优化）
           if (index_frame > 1)
           {
+               // 执行位姿优化：通过点到面残差最小化，迭代优化当前帧位姿
                zjloc::common::Timer::Evaluate([&]()
                                               { optimize(p_frame); },
                                               "optimize");
           }
 
+          // 是否将当前帧点云添加到全局地图中
           bool add_points = true;
           if (add_points)
-          { //   update map here
+          {
+               // 增量式地图更新：将当前帧的点云添加到体素地图中
                zjloc::common::Timer::Evaluate([&]()
                                               { map_incremental(p_frame); },
                                               "map update");
           }
 
+          // 视场角分割：移除超出当前传感器视场范围的地图点，控制地图规模
           zjloc::common::Timer::Evaluate([&]()
                                          { lasermap_fov_segment(); },
                                          "fov segment");
      }
 
+     /**
+      * [功能描述]: 位姿优化函数，使用Ceres求解器进行点到面ICP迭代优化
+      *            通过最小化点到平面的残差，优化当前帧的旋转和平移
+      * @param p_frame: 当前点云帧指针，包含待优化的点云和状态
+      */
      void lidarodom::optimize(cloudFrame *p_frame)
      {
+          // 获取当前帧状态，提取旋转四元数和平移向量作为优化变量
           state *curr_state = p_frame->p_state;
-          Eigen::Quaterniond end_quat = curr_state->rotation;
-          Eigen::Vector3d end_t = curr_state->translation;
+          Eigen::Quaterniond end_quat = curr_state->rotation;   // 待优化的旋转四元数
+          Eigen::Vector3d end_t = curr_state->translation;      // 待优化的平移向量
 
+          // ==================== 自适应降采样 ====================
           std::vector<point3D> surf_keypoints;
-          //   FIXME: adaptive filter, res_new = res_old*(N_scan/N_last);
+          // 对点云进行网格降采样，获取关键点用于优化
+          // FIXME: adaptive filter, res_new = res_old*(N_scan/N_last);
           gridSampling(p_frame->point_surf, surf_keypoints, adapt_sample_res * options_.surf_res);
+          
+          // 根据关键点数量自适应调整采样分辨率
           double tt = surf_keypoints.size() / options_.max_num_residuals;
           if (tt < 1)
           {
-               adapt_sample_res = 0.7 * adapt_sample_res; //   0.5~options_.sample_rate
+               // 关键点数量不足，降低采样分辨率以获取更多点
+               adapt_sample_res = 0.7 * adapt_sample_res; // 采样率范围：0.5 ~ options_.sample_rate
                if (adapt_sample_res < 0.5)
                     adapt_sample_res = 0.5;
           }
           else
+               // 关键点数量充足，恢复默认采样率
                adapt_sample_res = options_.sampling_rate;
 
+          // ==================== 定义点云变换Lambda函数 ====================
           size_t num_size = p_frame->point_surf.size();
+          /**
+           * transformKeypoints: 将点云从LiDAR坐标系变换到世界坐标系
+           * 变换公式: P_world = R * (T_IL * P_lidar) + t
+           * 其中: T_IL为LiDAR到IMU的外参, R和t为IMU到世界的位姿
+           */
           auto transformKeypoints = [&](std::vector<point3D> &point_frame)
           {
-               Eigen::Matrix3d R = end_quat.normalized().toRotationMatrix();
-               Eigen::Vector3d t = end_t;
+               Eigen::Matrix3d R = end_quat.normalized().toRotationMatrix();  // 旋转矩阵
+               Eigen::Vector3d t = end_t;                                      // 平移向量
 #ifdef P_USE_TBB_
+               // 使用TBB并行加速点云变换
                tbb::parallel_for(size_t(0), point_frame.size(), [&](size_t id)
                                  { point_frame[id].point = R * (TIL_ * point_frame[id].raw_point) + t;
                                    point_frame[id].normal = R * TIL_.rotationMatrix() * point_frame[id].raw_normal; });
 #else
+               // 串行方式进行点云变换
                for (auto &keypoint : point_frame)
                {
+                    // 变换点坐标: 先通过外参TIL_变换到IMU系，再通过R,t变换到世界系
                     keypoint.point = R * (TIL_ * keypoint.raw_point) + t;
+                    // 变换法向量: 只需旋转，不需要平移
                     keypoint.normal = R * TIL_.rotationMatrix() * keypoint.raw_normal;
                }
 #endif
           };
+
+          // ==================== ICP迭代优化主循环 ====================
           for (int iter(0); iter < options_.max_iteration; iter++)
           {
+               // 创建Huber鲁棒核函数，阈值0.5，用于抑制外点影响
                ceres::LossFunction *loss_function = new ceres::HuberLoss(0.5);
                ceres::Problem::Options problem_options;
                ceres::Problem problem(problem_options);
 
+               // 为四元数创建参数化器，确保优化过程中四元数保持单位范数
                auto *parameterization = new ceres::EigenQuaternionParameterization();
 
+               // 添加优化变量：四元数(4维)和平移向量(3维)
                problem.AddParameterBlock(&end_quat.x(), 4, parameterization);
                problem.AddParameterBlock(&end_t.x(), 3);
 
+               // 构建点到面残差因子
                std::vector<ceres::CostFunction *> surfFactor;
                addSurfCostFactor(surfFactor, surf_keypoints, p_frame);
 
+               // 将所有残差因子添加到优化问题中
                int surf_num = 0;
                if (options_.log_print)
                     std::cout << "get factor: " << surfFactor.size() << std::endl;
                for (auto &e : surfFactor)
                {
                     surf_num++;
+                    // 添加残差块：代价函数、鲁棒核、平移参数、旋转参数
                     problem.AddResidualBlock(e, loss_function, &end_t.x(), &end_quat.x());
                }
-               //   release
+               // 释放临时vector内存
                std::vector<ceres::CostFunction *>().swap(surfFactor);
 
+               // 检查残差数量是否足够，不足则终止优化
                if (surf_num < options_.min_num_residuals)
                {
                     std::stringstream ss_out;
@@ -306,26 +375,33 @@ namespace zjloc
                     return;
                }
 
+               // ==================== 配置Ceres求解器 ====================
                ceres::Solver::Options options;
-               options.max_num_iterations = 5;
-               options.num_threads = 6;
-               options.minimizer_progress_to_stdout = false;
+               options.max_num_iterations = 5;                    // 每次ICP迭代中的最大优化次数
+               options.num_threads = 6;                           // 并行线程数
+               options.minimizer_progress_to_stdout = false;      // 不打印优化过程
+               // 使用Levenberg-Marquardt信赖域策略
                options.trust_region_strategy_type = ceres::TrustRegionStrategyType::LEVENBERG_MARQUARDT;
 
                ceres::Solver::Summary summary;
 
+               // 执行优化求解
                ceres::Solve(options, &problem, &summary);
 
+               // ==================== 收敛性检查 ====================
+               // 计算本次迭代的位姿变化量
                double diff_trans = 0, diff_rot = 0;
-               diff_trans += (current_state->translation - end_t).norm();
-               diff_rot += AngularDistance(current_state->rotation, end_quat);
+               diff_trans += (current_state->translation - end_t).norm();      // 平移变化量(米)
+               diff_rot += AngularDistance(current_state->rotation, end_quat); // 旋转变化量(弧度)
 
+               // 更新点云帧状态和全局当前状态
                p_frame->p_state->translation = end_t;
                p_frame->p_state->rotation = end_quat;
 
                current_state->translation = end_t;
                current_state->rotation = end_quat;
 
+               // 如果旋转和平移变化量都小于阈值，认为已收敛，提前退出
                if (diff_rot < options_.thres_orientation_norm &&
                    diff_trans < options_.thres_translation_norm)
                {
@@ -334,8 +410,10 @@ namespace zjloc
                     break;
                }
           }
+
+          // 释放关键点内存
           std::vector<point3D>().swap(surf_keypoints);
-          //   transpose point before added
+          // 将优化后的位姿应用到原始点云，变换到世界坐标系（用于后续地图更新）
           transformKeypoints(p_frame->point_surf);
      }
 
@@ -381,16 +459,32 @@ namespace zjloc
           return neighborhood;
      }
 
+     /**
+      * [功能描述]: 构建点到面残差因子，用于Ceres优化
+      *            为每个关键点在体素地图中搜索邻近点，计算局部平面，构建点到面约束
+      * @param surf: 输出的残差因子列表（Ceres代价函数指针）
+      * @param keypoints: 当前帧的关键点集合
+      * @param p_frame: 当前点云帧指针，包含位姿状态信息
+      */
      void lidarodom::addSurfCostFactor(std::vector<ceres::CostFunction *> &surf,
                                        std::vector<point3D> &keypoints, const cloudFrame *p_frame)
      {
-
+          /**
+           * Lambda函数：估计点的邻域平面特性
+           * @param vector_neighbors: 邻近点集合
+           * @param location: 当前点在IMU坐标系下的位置
+           * @param planarity_weight: 输出的平面性权重（平面越平，权重越大）
+           * @return neighborhood: 邻域分布特性（包含法向量、平面性等）
+           */
           auto estimatePointNeighborhood = [&](std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>> &vector_neighbors,
                                                Eigen::Vector3d &location, double &planarity_weight)
           {
+               // 计算邻域点的分布特性（PCA分析得到法向量和平面性）
                auto neighborhood = computeNeighborhoodDistribution(vector_neighbors);
+               // 根据平面性计算权重，power_planarity控制权重的敏感度
                planarity_weight = std::pow(neighborhood.a2D, options_.power_planarity);
 
+               // 确保法向量指向传感器方向（法向量一致性校正）
                if (neighborhood.normal.dot(p_frame->p_state->translation - location) < 0)
                {
                     neighborhood.normal = -1.0 * neighborhood.normal;
@@ -398,32 +492,43 @@ namespace zjloc
                return neighborhood;
           };
 
-          double lambda_weight = std::abs(options_.weight_alpha);
-          double lambda_neighborhood = std::abs(options_.weight_neighborhood);
-          const double kMaxPointToPlane = options_.max_dist_to_plane_icp;
+          // ==================== 权重参数归一化 ====================
+          double lambda_weight = std::abs(options_.weight_alpha);           // 平面性权重系数
+          double lambda_neighborhood = std::abs(options_.weight_neighborhood); // 邻域距离权重系数
+          const double kMaxPointToPlane = options_.max_dist_to_plane_icp;   // 点到面最大距离阈值
           const double sum = lambda_weight + lambda_neighborhood;
 
+          // 归一化权重，使两个权重之和为1
           lambda_weight /= sum;
           lambda_neighborhood /= sum;
 
+          // ==================== 自适应参数设置 ====================
+          // 初始化阶段使用更小的搜索范围，后续使用配置值
           const short nb_voxels_visited = p_frame->frame_id < options_.init_num_frames
-                                              ? 2
-                                              : options_.voxel_neighborhood;
+                                              ? 2  // 初始化阶段：搜索2个邻近体素
+                                              : options_.voxel_neighborhood;  // 正常阶段：使用配置的邻域大小
 
+          // 体素占用阈值：初始化阶段要求更低
           const int kThresholdCapacity = p_frame->frame_id < options_.init_num_frames
-                                             ? 1
-                                             : options_.threshold_voxel_occupancy;
+                                             ? 1  // 初始化阶段：体素内至少1个点
+                                             : options_.threshold_voxel_occupancy;  // 正常阶段：使用配置阈值
 
           size_t num = keypoints.size();
-          int num_residuals = 0;
+          int num_residuals = 0;  // 已添加的残差数量计数器
 
+          // ==================== 遍历所有关键点，构建残差因子 ====================
           for (int k = 0; k < num; k++)
           {
                auto &keypoint = keypoints[k];
                auto &raw_point = keypoint.raw_point;
+               
+               // 将原始点从LiDAR坐标系变换到世界坐标系
+               // P_world = R * (T_IL * P_lidar) + t
                keypoint.point = p_frame->p_state->rotation * (TIL_ * raw_point) + p_frame->p_state->translation;
+               // 变换法向量（只旋转，不平移）
                keypoint.normal = p_frame->p_state->rotation * TIL_.unit_quaternion() * keypoint.raw_normal;
 
+               // 在体素地图中搜索当前点的邻近点
                std::vector<voxel> voxels;
                auto vector_neighbors = searchNeighbors(voxel_map, keypoint.point,
                                                        keypoint.normal, nb_voxels_visited,
@@ -434,15 +539,20 @@ namespace zjloc
                                                            ? nullptr
                                                            : &voxels);
 
+               // 邻近点数量不足，跳过该关键点
                if (vector_neighbors.size() < options_.min_number_neighbors)
                     continue;
 
                double weight;
 
+               // 计算点在IMU坐标系下的位置（用于法向量方向校正）
                Eigen::Vector3d location = TIL_ * raw_point;
 
+               // 估计邻域平面特性，获取法向量和平面性权重
                auto neighborhood = estimatePointNeighborhood(vector_neighbors, location, weight);
 
+               // 计算综合权重：平面性权重 + 邻域距离权重
+               // 距离越近、平面性越好，权重越大
                weight = lambda_weight * weight + lambda_neighborhood *
                                                      std::exp(-(vector_neighbors[0] -
                                                                 keypoint.point)
@@ -450,25 +560,37 @@ namespace zjloc
                                                               (kMaxPointToPlane *
                                                                options_.min_number_neighbors));
 
+               // ==================== 构建点到面残差 ====================
                double point_to_plane_dist;
                std::set<voxel> neighbor_voxels;
+               
+               // 对最近的几个邻近点分别构建残差
                for (int i(0); i < options_.num_closest_neighbors; ++i)
                {
+                    // 计算点到平面的距离：|（P - Q）· n|
+                    // P为当前点，Q为邻近点，n为平面法向量
                     point_to_plane_dist = std::abs((keypoint.point - vector_neighbors[i]).transpose() * neighborhood.normal);
 
+                    // 距离小于阈值才添加残差（过滤外点）
                     if (point_to_plane_dist < options_.max_dist_to_plane_icp)
                     {
 
                          num_residuals++;
 
+                         // 归一化法向量
                          Eigen::Vector3d norm_vector = neighborhood.normal;
                          norm_vector.normalize();
 
+                         // 计算平面方程的偏移量 d = -n · Q
                          double norm_offset = -norm_vector.dot(vector_neighbors[i]);
 
+                         // 将点变换回body坐标系（用于优化，因为优化变量是body系位姿）
+                         // P_body = R^(-1) * P_world - R^(-1) * t
                          Eigen::Vector3d point_end = p_frame->p_state->rotation.inverse() * keypoints[k].point -
                                                      p_frame->p_state->rotation.inverse() * p_frame->p_state->translation;
 
+                         // 创建点到面代价函数
+                         // 参数：参考点（地图点）、当前点（body系）、法向量、权重
                          auto *cost_function = zjloc::PointToPlaneFunctor::Create(vector_neighbors[0],
                                                                                   point_end, norm_vector, weight);
 
@@ -476,6 +598,7 @@ namespace zjloc
                     }
                }
 
+               // 残差数量达到上限，提前退出
                if (num_residuals >= options_.max_num_residuals)
                     break;
           }
@@ -681,17 +804,32 @@ namespace zjloc
           pcl_points->points.push_back(cloudTemp);
      }
 
+     /**
+      * [功能描述]: 增量式地图更新函数，将当前帧点云添加到体素地图中
+      * @param p_frame: 当前点云帧指针，包含已变换到世界坐标系的点云
+      * @param min_num_points: 体素内最小点数阈值，默认值为0
+      */
      void lidarodom::map_incremental(cloudFrame *p_frame, int min_num_points)
      {
+          // 遍历当前帧的所有面点，逐个添加到体素地图中
           for (const auto &point : p_frame->point_surf)
+               // 添加点到体素地图，参数依次为：
+               // voxel_map: 全局体素地图
+               // point: 待添加的点
+               // size_voxel_map: 体素大小
+               // max_num_points_in_voxel: 每个体素内最大点数
+               // min_distance_points: 体素内点之间的最小距离（避免点过于密集）
+               // min_num_points: 体素内最小点数阈值
                addPointToMap(voxel_map, point,
                              options_.size_voxel_map, options_.max_num_points_in_voxel,
                              options_.min_distance_points, min_num_points);
 
-          { //   pub cloud
+          // 发布点云到ROS用于可视化
+          {
                std::string laser_topic = "laser";
                pub_cloud_to_ros(laser_topic, points_world, p_frame->time_frame_end);
           }
+          // 清空世界坐标系点云缓存，为下一帧做准备
           points_world->clear();
      }
 
