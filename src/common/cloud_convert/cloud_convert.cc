@@ -47,26 +47,37 @@ namespace zjloc
         pcl_out = cloud_out_;
     }
 
+    /**
+     * [功能描述]: 处理 Livox Avia 激光雷达的自定义点云消息
+     *            包括：点云滤波、KD树构建、法向量估计、时间戳计算
+     * @param msg: Livox ROS驱动发布的自定义点云消息（CustomMsg类型）
+     */
     void CloudConvert::AviaHandler(const livox_ros_driver2::CustomMsg::ConstPtr &msg)
     {
+        // 清空输出点云容器
         cloud_out_.clear();
         cloud_full_.clear();
-        int plsize = msg->point_num;
-        cloud_out_.reserve(plsize);
+        int plsize = msg->point_num;  // 点云中的点数
+        cloud_out_.reserve(plsize);   // 预分配内存
 
+        // 时间单位转换：Livox的offset_time单位是纳秒，需转换为秒
         static double tm_scale = 1e9;
 
+        // 获取消息头的时间戳（帧起始时间）
         double headertime = msg->header.stamp.toSec();
+        // 计算帧时间跨度：最后一个点的相对时间即为整帧扫描耗时
         timespan_ = msg->points.back().offset_time / tm_scale;
 
         // std::cout << "span:" << timespan_ << ",0: " << msg->points[0].offset_time / tm_scale
         //           << " , 100: " << msg->points[100].offset_time / tm_scale << std::endl;
 
+        // ==================== 步骤1: 构建有效点云用于KD树 ====================
         zjloc::common::TicToc tc;
         tc.tic();
         CloudPtr cloud(new PointCloudType);
         for (int i = 0; i < plsize; i++)
         {
+            // 过滤无效点（NaN或Inf）
             if (!(std::isfinite(msg->points[i].x) &&
                   std::isfinite(msg->points[i].y) &&
                   std::isfinite(msg->points[i].z)))
@@ -75,165 +86,203 @@ namespace zjloc
             pt.x = msg->points[i].x;
             pt.y = msg->points[i].y;
             pt.z = msg->points[i].z;
-            pt.intensity = msg->points[i].reflectivity;
+            pt.intensity = msg->points[i].reflectivity;  // 反射强度
             cloud->push_back(pt);
         }
-        double t1 = tc.toc();
+        double t1 = tc.toc();  // 记录点云构建耗时
+        
+        // ==================== 步骤2: 构建KD树用于邻域搜索 ====================
         tc.tic();
         nanoflann::KdTreeFLANN<PointType> nano_kdtree;
         nano_kdtree.setInputCloud(cloud);
-        double t2 = tc.toc();
+        double t2 = tc.toc();  // 记录KD树构建耗时
         tc.tic();
 
+        // ==================== 步骤3: 遍历点云，计算法向量 ====================
 #ifdef USE_TBB_PARAL
-        std::mutex valid_points_mutex;
+        // TBB并行版本：使用多线程加速处理
+        std::mutex valid_points_mutex;  // 用于保护共享数据的互斥锁
         tbb::parallel_for(tbb::blocked_range<size_t>(0, plsize),
                           [&](const tbb::blocked_range<size_t> &r)
                           {
-                              std::vector<point3D> local_points;
+                              std::vector<point3D> local_points;  // 每个线程的局部点云
                               for (size_t i = r.begin(); i != r.end(); ++i)
                               {
+                                  // 过滤无效点
                                   if (!(std::isfinite(msg->points[i].x) &&
                                         std::isfinite(msg->points[i].y) &&
                                         std::isfinite(msg->points[i].z)))
                                       continue;
+                                  // 降采样：每隔point_filter_num个点取一个
                                   if (i % param_.point_filter_num != 0)
                                       continue;
+                                  // 距离滤波：过滤太远(>250m)或太近(<blind)的点
                                   double range = msg->points[i].x * msg->points[i].x + msg->points[i].y * msg->points[i].y +
                                                  msg->points[i].z * msg->points[i].z;
                                   if (range > 250 * 250 || range < param_.blind * param_.blind)
                                       continue;
 
+                                  /**
+                                   * Lambda函数：根据距离自适应计算邻域搜索半径
+                                   * 近距离点用小半径（精细），远距离点用大半径（粗略）
+                                   */
                                   auto adaptive_r = [&](pcl::PointXYZI &pt)
                                   {
-                                      double max_dist = 30;
-                                      double min_dist = 5;
-                                      double max_r = 4;
-                                      double min_r = 0.2;
-                                      double dist = pt.getVector3fMap().norm();
+                                      double max_dist = 30;   // 最大距离阈值
+                                      double min_dist = 5;    // 最小距离阈值
+                                      double max_r = 4;       // 最大搜索半径
+                                      double min_r = 0.2;     // 最小搜索半径
+                                      double dist = pt.getVector3fMap().norm();  // 计算点到原点的距离
                                       if (dist > max_dist)
                                           return max_r;
                                       if (dist < min_dist)
                                           return min_r;
+                                      // 线性插值计算半径
                                       return (dist - min_dist) / (max_dist - min_dist) * (max_r - min_r);
                                   };
 
+                                  // 检查点的有效性标签（Livox特有的tag字段）
+                                  // tag & 0x30 == 0x10: 正常回波
+                                  // tag & 0x30 == 0x00: 第一回波
                                   if (/*(msg->points[i].line < N_SCANS) &&*/ ((msg->points[i].tag & 0x30) == 0x10 || (msg->points[i].tag & 0x30) == 0x00))
                                   {
                                       PointType pt;
                                       pt.x = msg->points[i].x, pt.y = msg->points[i].y, pt.z = msg->points[i].z;
                                       pt.intensity = msg->points[i].reflectivity;
-                                      double radius = adaptive_r(pt);
+                                      double radius = adaptive_r(pt);  // 计算自适应搜索半径
 
+                                      // 在KD树中进行半径搜索，寻找邻近点
                                       std::vector<int> pointIdxRSearch;
                                       std::vector<float> pointRSquaredDistance;
+                                      // 只有找到超过5个邻近点时才计算法向量（确保PCA稳定）
                                       if (nano_kdtree.radiusSearch(pt, radius, pointIdxRSearch, pointRSquaredDistance) > 5)
                                       {
+                                          // 收集邻近点坐标
                                           std::vector<Eigen::Vector3f> neighbors;
                                           for (size_t j = 0; j < pointIdxRSearch.size(); ++j)
                                           {
                                               neighbors.push_back(cloud->points[pointIdxRSearch[j]].getVector3fMap());
                                           }
 
+                                          // 通过PCA计算法向量
                                           Eigen::Vector3f normal = computeNormal(neighbors);
 
+                                          // 构建point3D结构体，填充所有必要信息
                                           point3D point_temp;
                                           point_temp.raw_point = Eigen::Vector3d(msg->points[i].x, msg->points[i].y, msg->points[i].z);
                                           point_temp.point = point_temp.raw_point;
-                                          point_temp.raw_normal = normal.cast<double>();
+                                          point_temp.raw_normal = normal.cast<double>();  // 法向量（LiDAR坐标系）
                                           point_temp.normal = point_temp.raw_normal;
-                                          point_temp.relative_time = msg->points[i].offset_time / tm_scale; // curvature unit: ms
+                                          point_temp.relative_time = msg->points[i].offset_time / tm_scale;  // 相对时间（秒）
                                           point_temp.intensity = msg->points[i].reflectivity;
 
-                                          point_temp.timestamp = headertime + point_temp.relative_time;
-                                          point_temp.alpha_time = point_temp.relative_time / timespan_;
-                                          point_temp.timespan = timespan_;
-                                          point_temp.ring = msg->points[i].line;
-                                          point_temp.lid = 1;
+                                          point_temp.timestamp = headertime + point_temp.relative_time;  // 绝对时间戳
+                                          point_temp.alpha_time = point_temp.relative_time / timespan_;  // 归一化时间[0,1]
+                                          point_temp.timespan = timespan_;  // 帧时间跨度
+                                          point_temp.ring = msg->points[i].line;  // 扫描线ID
+                                          point_temp.lid = 1;  // LiDAR ID
 
                                           local_points.push_back(point_temp);
                                       }
                                   }
                               }
+                              // 使用互斥锁将局部结果合并到全局输出
                               std::lock_guard<std::mutex> lock(valid_points_mutex);
                               cloud_out_.insert(cloud_out_.end(), local_points.begin(), local_points.end());
                           });
 
 #else
+        // 串行版本：单线程处理
         for (int i = 0; i < plsize; i++)
         {
+            // 过滤无效点
             if (!(std::isfinite(msg->points[i].x) &&
                   std::isfinite(msg->points[i].y) &&
                   std::isfinite(msg->points[i].z)))
                 continue;
 
+            // 时间戳合法性检查
             if (msg->points[i].offset_time / tm_scale > timespan_)
                 std::cout << "------" << __FUNCTION__ << ", " << __LINE__ << ", error timespan:" << timespan_ << " < " << msg->points[i].offset_time / tm_scale << std::endl;
 
+            // 降采样：每隔point_filter_num个点取一个
             if (i % param_.point_filter_num != 0)
                 continue;
 
             // if (msg->points[i].reflectivity < 5)
             //     continue;
 
+            // 距离滤波：过滤太远(>250m)或太近(<blind)的点
             double range = msg->points[i].x * msg->points[i].x + msg->points[i].y * msg->points[i].y +
                            msg->points[i].z * msg->points[i].z;
             if (range > 250 * 250 || range < param_.blind * param_.blind)
                 continue;
 
+            /**
+             * Lambda函数：根据距离自适应计算邻域搜索半径
+             * 近距离点用小半径（精细），远距离点用大半径（粗略）
+             */
             auto adaptive_r = [&](pcl::PointXYZI &pt)
             {
-                double max_dist = 30;
-                double min_dist = 5;
-                double max_r = 4;
-                double min_r = 0.2;
-                double dist = pt.getVector3fMap().norm();
+                double max_dist = 30;   // 最大距离阈值
+                double min_dist = 5;    // 最小距离阈值
+                double max_r = 4;       // 最大搜索半径
+                double min_r = 0.2;     // 最小搜索半径
+                double dist = pt.getVector3fMap().norm();  // 计算点到原点的距离
                 if (dist > max_dist)
                     return max_r;
                 if (dist < min_dist)
                     return min_r;
+                // 线性插值计算半径
                 return (dist - min_dist) / (max_dist - min_dist) * (max_r - min_r);
             };
 
+            // 检查点的有效性标签
             if (/*(msg->points[i].line < N_SCANS) &&*/ ((msg->points[i].tag & 0x30) == 0x10 || (msg->points[i].tag & 0x30) == 0x00))
             {
                 PointType pt;
                 pt.x = msg->points[i].x, pt.y = msg->points[i].y, pt.z = msg->points[i].z;
                 pt.intensity = msg->points[i].reflectivity;
-                double radius = adaptive_r(pt);
+                double radius = adaptive_r(pt);  // 计算自适应搜索半径
 
+                // 在KD树中进行半径搜索
                 std::vector<int> pointIdxRSearch;
                 std::vector<float> pointRSquaredDistance;
+                // 只有找到超过5个邻近点时才计算法向量
                 if (nano_kdtree.radiusSearch(pt, radius, pointIdxRSearch, pointRSquaredDistance) > 5)
                 {
+                    // 收集邻近点坐标
                     std::vector<Eigen::Vector3f> neighbors;
                     for (size_t j = 0; j < pointIdxRSearch.size(); ++j)
                     {
                         neighbors.push_back(cloud->points[pointIdxRSearch[j]].getVector3fMap());
                     }
 
+                    // 通过PCA计算法向量
                     Eigen::Vector3f normal = computeNormal(neighbors);
 
+                    // 构建point3D结构体
                     point3D point_temp;
                     point_temp.raw_point = Eigen::Vector3d(msg->points[i].x, msg->points[i].y, msg->points[i].z);
                     point_temp.point = point_temp.raw_point;
-                    point_temp.raw_normal = normal.cast<double>();
+                    point_temp.raw_normal = normal.cast<double>();  // 法向量
                     point_temp.normal = point_temp.raw_normal;
-                    point_temp.relative_time = msg->points[i].offset_time / tm_scale; // curvature unit: ms
+                    point_temp.relative_time = msg->points[i].offset_time / tm_scale;  // 相对时间（秒）
                     point_temp.intensity = msg->points[i].reflectivity;
 
-                    point_temp.timestamp = headertime + point_temp.relative_time;
-                    point_temp.alpha_time = point_temp.relative_time / timespan_;
-                    point_temp.timespan = timespan_;
-                    point_temp.ring = msg->points[i].line;
-                    point_temp.lid = 1;
+                    point_temp.timestamp = headertime + point_temp.relative_time;  // 绝对时间戳
+                    point_temp.alpha_time = point_temp.relative_time / timespan_;  // 归一化时间[0,1]
+                    point_temp.timespan = timespan_;  // 帧时间跨度
+                    point_temp.ring = msg->points[i].line;  // 扫描线ID
+                    point_temp.lid = 1;  // LiDAR ID
 
                     cloud_out_.push_back(point_temp);
                 }
             }
         }
 #endif
-        double t3 = tc.toc();
+        double t3 = tc.toc();  // 记录点云处理耗时
+        // 输出各步骤耗时：t1=点云构建, t2=KD树构建, t3=法向量计算
         std::cout << "takes: " << t1 << ", " << t2 << ", " << t3 << std::endl;
     }
 
@@ -756,27 +805,46 @@ namespace zjloc
         // std::cout << "cloud size out: " << cloud_out_.size() << std::endl;
     }
 
-    //  计算协方差矩阵的最小特征值对应的特征向量，即法向量
+    /**
+     * [功能描述]: 通过PCA主成分分析计算邻域点的法向量
+     *            法向量为协方差矩阵最小特征值对应的特征向量
+     * @param neighbors: 邻域点集合（LiDAR坐标系下的3D点）
+     * @return 法向量（归一化，指向LiDAR传感器方向）
+     */
     Eigen::Vector3f CloudConvert::computeNormal(const std::vector<Eigen::Vector3f> &neighbors)
     {
-        //  计算质心  计算协方差
-        Eigen::Vector3f centroid = Eigen::Vector3f::Zero();
-        Eigen::Matrix3f covariance = Eigen::Matrix3f::Zero();
+        // ==================== 步骤1: 计算质心和协方差矩阵 ====================
+        Eigen::Vector3f centroid = Eigen::Vector3f::Zero();   // 质心（均值）
+        Eigen::Matrix3f covariance = Eigen::Matrix3f::Zero(); // 协方差矩阵
 
+        // 累加所有点的坐标和外积
         for (const auto &point : neighbors)
         {
-            centroid += point;
-            covariance += point * point.transpose();
+            centroid += point;                       // 累加坐标，用于计算均值
+            covariance += point * point.transpose(); // 累加外积 p * p^T
         }
+        // 计算均值（质心）
         centroid /= (float)neighbors.size();
+        // 计算协方差矩阵：Cov = E[p*p^T] - E[p]*E[p]^T
+        // 这是协方差矩阵的简化计算公式，避免了两次遍历
         covariance /= (float)neighbors.size();
         covariance -= centroid * centroid.transpose();
 
-        //  计算协方差矩阵的特征值和特征向量
+        // ==================== 步骤2: 特征值分解（PCA） ====================
+        // 使用自伴随特征值求解器（适用于对称矩阵）
+        // 特征值按升序排列：eigenvalues[0] < eigenvalues[1] < eigenvalues[2]
         Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> solver(covariance);
-        Eigen::Vector3f normal(solver.eigenvectors().col(0).normalized()); //  最小特征值对应的特征向量
+        // 最小特征值对应的特征向量即为法向量方向
+        // 因为平面上点的分布在法向量方向上方差最小
+        Eigen::Vector3f normal(solver.eigenvectors().col(0).normalized());
+        
+        // ==================== 步骤3: 法向量方向校正 ====================
+        // 确保法向量指向LiDAR传感器（即原点方向）
+        // -centroid 是从质心指向原点的向量
+        // 如果法向量与该向量夹角 > 90°（点积 < 0），则翻转法向量
         if (normal.dot(-centroid) < 0)
             normal *= -1.0;
+            
         return normal;
     }
 

@@ -417,40 +417,69 @@ namespace zjloc
           transformKeypoints(p_frame->point_surf);
      }
 
+     /**
+      * [功能描述]: 计算邻域点云的分布特性（PCA主成分分析）
+      *            通过协方差矩阵的特征值分解，提取法向量和平面性特征
+      * @param points: 邻域点集合（世界坐标系下的3D点）
+      * @return Neighborhood: 包含中心点、法向量、协方差矩阵、平面性等信息的结构体
+      */
      Neighborhood lidarodom::computeNeighborhoodDistribution(const std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>> &points)
      {
           Neighborhood neighborhood;
-          // Compute the normals
+          
+          // ==================== 步骤1: 计算质心（重心） ====================
           Eigen::Vector3d barycenter(Eigen::Vector3d(0, 0, 0));
           for (auto &point : points)
           {
                barycenter += point;
           }
-
+          // 质心 = 所有点坐标的算术平均值
           barycenter /= (double)points.size();
           neighborhood.center = barycenter;
 
+          // ==================== 步骤2: 计算协方差矩阵 ====================
+          // 协方差矩阵描述点云的分布形状
+          // Cov(i,j) = Σ(p_i - mean_i)(p_j - mean_j)
           Eigen::Matrix3d covariance_Matrix(Eigen::Matrix3d::Zero());
           for (auto &point : points)
           {
+               // 只计算上三角部分（因为协方差矩阵是对称的）
                for (int k = 0; k < 3; ++k)
                     for (int l = k; l < 3; ++l)
                          covariance_Matrix(k, l) += (point(k) - barycenter(k)) *
                                                     (point(l) - barycenter(l));
           }
+          // 填充下三角部分（对称矩阵）
           covariance_Matrix(1, 0) = covariance_Matrix(0, 1);
           covariance_Matrix(2, 0) = covariance_Matrix(0, 2);
           covariance_Matrix(2, 1) = covariance_Matrix(1, 2);
           neighborhood.covariance = covariance_Matrix;
+          
+          // ==================== 步骤3: 特征值分解（PCA） ====================
+          // 使用自伴随特征值求解器（适用于对称矩阵）
+          // 特征值按升序排列：eigenvalues[0] < eigenvalues[1] < eigenvalues[2]
           Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(covariance_Matrix);
+          
+          // 最小特征值对应的特征向量即为法向量方向
+          // 因为平面上点的分布在法向量方向上方差最小
           Eigen::Vector3d normal(es.eigenvectors().col(0).normalized());
           neighborhood.normal = normal;
 
-          double sigma_1 = sqrt(std::abs(es.eigenvalues()[2]));
-          double sigma_2 = sqrt(std::abs(es.eigenvalues()[1]));
-          double sigma_3 = sqrt(std::abs(es.eigenvalues()[0]));
+          // ==================== 步骤4: 计算平面性特征 a2D ====================
+          // sigma_1, sigma_2, sigma_3 分别对应最大、中间、最小特征值的平方根
+          // 它们表示点云在三个主方向上的分布程度（标准差）
+          double sigma_1 = sqrt(std::abs(es.eigenvalues()[2]));  // 最大特征值 -> 第一主方向
+          double sigma_2 = sqrt(std::abs(es.eigenvalues()[1]));  // 中间特征值 -> 第二主方向
+          double sigma_3 = sqrt(std::abs(es.eigenvalues()[0]));  // 最小特征值 -> 法向量方向
+          
+          // a2D = (σ₂ - σ₃) / σ₁
+          // 平面性指标：
+          // - 理想平面: σ₃ ≈ 0, a2D ≈ σ₂/σ₁ (较大)
+          // - 线状分布: σ₂ ≈ σ₃ ≈ 0, a2D ≈ 0
+          // - 球状分布: σ₁ ≈ σ₂ ≈ σ₃, a2D ≈ 0
           neighborhood.a2D = (sigma_2 - sigma_3) / sigma_1;
 
+          // 检查NaN（当a2D != a2D时表示出现NaN）
           if (neighborhood.a2D != neighborhood.a2D)
           {
                throw std::runtime_error("error");
@@ -617,29 +646,53 @@ namespace zjloc
 
      using priority_queue_t = std::priority_queue<pair_distance_t, std::vector<pair_distance_t>, comparator>;
 
+     /**
+      * [功能描述]: 在体素地图中搜索给定点的邻近点
+      *            使用法向量一致性过滤，只返回法向量方向相似的邻近点
+      *            利用优先队列维护距离最近的K个邻近点
+      * @param map: 体素哈希地图，存储所有地图点
+      * @param point: 查询点的位置（世界坐标系）
+      * @param normal: 查询点的法向量，用于法向量一致性过滤
+      * @param nb_voxels_visited: 搜索邻域大小（以体素为单位），搜索范围为 [-n, n]
+      * @param size_voxel_map: 体素大小（米）
+      * @param max_num_neighbors: 返回的最大邻近点数量
+      * @param threshold_voxel_capacity: 体素内最小点数阈值，点数不足的体素被跳过
+      * @param voxels: 可选输出，返回邻近点所属的体素索引
+      * @return 邻近点坐标列表，按距离从近到远排序
+      */
      std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>>
      lidarodom::searchNeighbors(const voxelHashMap2 &map, const Eigen::Vector3d &point,
                                 const Eigen::Vector3d &normal, int nb_voxels_visited,
                                 double size_voxel_map, int max_num_neighbors,
                                 int threshold_voxel_capacity, std::vector<voxel> *voxels)
      {
-
+          // 预分配体素索引输出容器
           if (voxels != nullptr)
                voxels->reserve(max_num_neighbors);
 
+          // ==================== 步骤1: 计算查询点所属的体素索引 ====================
           short kx = static_cast<short>(point[0] / size_voxel_map);
           short ky = static_cast<short>(point[1] / size_voxel_map);
           short kz = static_cast<short>(point[2] / size_voxel_map);
 
+          /**
+           * Lambda函数：计算两个向量之间的夹角（单位：度）
+           * @param v1, v2: 两个归一化向量
+           * @return 夹角（0° ~ 180°）
+           */
           auto calculateAngle = [&](const Eigen::Vector3d &v1, const Eigen::Vector3d &v2)
           {
                double dot_product = v1.dot(v2);
-               return std::acos(dot_product) * 180.0 / M_PI; //   degree
+               return std::acos(dot_product) * 180.0 / M_PI; // 转换为角度
           };
 
+          // 优先队列：按距离排序，存储(距离, 点坐标, 体素索引)
+          // 大顶堆：队首是距离最大的元素，方便淘汰最远的点
           priority_queue_t priority_queue;
 
+          // ==================== 步骤2: 遍历邻域体素，搜索邻近点 ====================
           voxel voxel_temp(kx, ky, kz);
+          // 三重循环遍历以(kx,ky,kz)为中心的立方体邻域
           for (short kxx = kx - nb_voxels_visited; kxx < kx + nb_voxels_visited + 1; ++kxx)
           {
                for (short kyy = ky - nb_voxels_visited; kyy < ky + nb_voxels_visited + 1; ++kyy)
@@ -650,27 +703,37 @@ namespace zjloc
                          voxel_temp.y = kyy;
                          voxel_temp.z = kzz;
 
+                         // 在哈希表中查找该体素
                          auto search = map.find(voxel_temp);
                          if (search != map.end())
                          {
                               const auto &voxel_block = search.value();
-                              // 先判断跟主方向的角度差异
+                              
+                              // ========== 处理主方向点集（points） ==========
+                              // 先判断体素的主法向量与查询点法向量的夹角
                               double angle = calculateAngle(voxel_block.normal, normal);
-                              if (angle < 90.0)
+                              if (angle < 90.0)  // 夹角小于90°才考虑（法向量方向大致相同）
                               {
+                                   // 体素内点数不足阈值则跳过
                                    if (voxel_block.NumPoints() < threshold_voxel_capacity)
                                         continue;
+                                   // 遍历体素内的每个点
                                    for (int i(0); i < voxel_block.NumPoints(); ++i)
                                    {
                                         auto &neighbor = voxel_block.points[i];
+                                        // 检查单点法向量与查询点法向量的夹角
                                         double angle = calculateAngle(neighbor.getNormal(), normal);
-                                        if (angle > 100.0)
+                                        if (angle > 100.0)  // 夹角大于100°则跳过（法向量方向差异太大）
                                              continue;
 
+                                        // 计算点到查询点的距离
                                         Eigen::Vector3d neighbor_point = neighbor.getPosition();
                                         double distance = (neighbor_point - point).norm();
+                                        
+                                        // 维护大小为max_num_neighbors的优先队列
                                         if (priority_queue.size() == max_num_neighbors)
                                         {
+                                             // 队列已满，只有当新点距离更近时才替换队首（最远的点）
                                              if (distance < std::get<0>(priority_queue.top()))
                                              {
                                                   priority_queue.pop();
@@ -678,10 +741,13 @@ namespace zjloc
                                              }
                                         }
                                         else
+                                             // 队列未满，直接加入
                                              priority_queue.emplace(distance, neighbor_point, voxel_temp);
                                    }
                               }
 
+                              // ========== 处理次方向点集（other_points） ==========
+                              // 体素内可能存储两个方向的平面点（双面体素）
                               angle = calculateAngle(voxel_block.other_normal, normal);
                               if (angle < 90.0)
                               {
@@ -713,56 +779,83 @@ namespace zjloc
                }
           }
 
+          // ==================== 步骤3: 从优先队列中提取结果 ====================
           auto size = priority_queue.size();
           std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>> closest_neighbors(size);
           if (voxels != nullptr)
           {
                voxels->resize(size);
           }
+          // 优先队列是大顶堆，队首是最远的点
+          // 倒序填充结果数组，使得最终结果按距离从近到远排序
           for (auto i = 0; i < size; ++i)
           {
-               closest_neighbors[size - 1 - i] = std::get<1>(priority_queue.top());
+               closest_neighbors[size - 1 - i] = std::get<1>(priority_queue.top());  // 点坐标
                if (voxels != nullptr)
-                    (*voxels)[size - 1 - i] = std::get<2>(priority_queue.top());
+                    (*voxels)[size - 1 - i] = std::get<2>(priority_queue.top());     // 体素索引
                priority_queue.pop();
           }
 
           return closest_neighbors;
      }
 
+     /**
+      * [功能描述]: 将点添加到体素地图中
+      *            包含法向量一致性检查、距离过滤、容量控制等策略
+      * @param map: 体素哈希地图（引用，会被修改）
+      * @param pt: 待添加的点（包含位置、法向量、强度等信息）
+      * @param voxel_size: 体素大小（米）
+      * @param max_num_points_in_voxel: 每个体素内最大点数
+      * @param min_distance_points: 体素内点之间的最小距离（避免过于密集）
+      * @param min_num_points: 体素内最小点数阈值（用于延迟添加策略）
+      */
      void lidarodom::addPointToMap(voxelHashMap2 &map, const point3D &pt, double voxel_size,
                                    int max_num_points_in_voxel, double min_distance_points,
                                    int min_num_points)
      {
+          // ==================== 步骤1: 计算点所属的体素索引 ====================
           short kx = static_cast<short>(pt.point[0] / voxel_size);
           short ky = static_cast<short>(pt.point[1] / voxel_size);
           short kz = static_cast<short>(pt.point[2] / voxel_size);
 
+          // 将点添加到用于可视化的PCL点云中
           addPointToPcl(points_world, pt.point, pt.intensity);
 
+          // 在哈希表中查找该体素
           voxelHashMap2::iterator search = map.find(voxel(kx, ky, kz));
 
+          /**
+           * Lambda函数：计算两个向量之间的夹角（单位：度）
+           */
           auto calculateAngle = [&](const Eigen::Vector3d &v1, const Eigen::Vector3d &v2)
           {
                double dot_product = v1.dot(v2);
-               return std::acos(dot_product) * 180.0 / M_PI; //   degree
+               return std::acos(dot_product) * 180.0 / M_PI; // 转换为角度
           };
 
+          // ==================== 步骤2: 根据体素是否存在采取不同策略 ====================
           if (search != map.end())
           {
+               // ========== 体素已存在 ==========
                auto &voxel_block = (search.value());
-               // degree with the main
+               
+               // 计算新点法向量与体素主法向量的夹角
                double angle = calculateAngle(pt.normal, voxel_block.normal);
+               
                if (angle > 100.0)
                {
+                    // 法向量夹角过大（>100°），说明新点属于不同方向的平面
+                    // 重置体素块，用新点替换（处理场景变化或动态物体）
                     voxelBlock3 block(max_num_points_in_voxel);
                     block.AddPoint(normalPoint(pt));
                     voxel_block = block;
                }
-
                else if (!voxel_block.IsFull())
                {
-                    double sq_dist_min_to_points = 10 * voxel_size * voxel_size;
+                    // 体素未满且法向量一致，尝试添加点
+                    
+                    // 计算新点与体素内现有点的最小距离平方
+                    double sq_dist_min_to_points = 10 * voxel_size * voxel_size;  // 初始化为较大值
                     for (int i(0); i < voxel_block.NumPoints(); ++i)
                     {
                          auto &_point = voxel_block.points[i];
@@ -772,21 +865,31 @@ namespace zjloc
                               sq_dist_min_to_points = sq_dist;
                          }
                     }
+                    
+                    // 只有当新点与所有现有点的距离都大于阈值时才添加
+                    // 避免点过于密集，保持空间分布均匀
                     if (sq_dist_min_to_points > (min_distance_points * min_distance_points))
                     {
+                         // min_num_points <= 0 表示无延迟添加限制
+                         // 或者体素内点数已达到最小阈值才允许继续添加
                          if (min_num_points <= 0 || voxel_block.NumPoints() >= min_num_points)
                          {
                               voxel_block.AddPoint(normalPoint(pt));
                          }
                     }
                }
+               // 如果体素已满（IsFull()），则不添加新点
           }
           else
           {
+               // ========== 体素不存在，需要创建新体素 ==========
+               // 只有当 min_num_points <= 0 时才立即创建
+               // 否则需要等待累积足够的点（延迟创建策略）
                if (min_num_points <= 0)
                {
                     voxelBlock3 block(max_num_points_in_voxel);
                     block.AddPoint(normalPoint(pt));
+                    // 使用move语义避免拷贝，提高效率
                     map[voxel(kx, ky, kz)] = std::move(block);
                }
           }
